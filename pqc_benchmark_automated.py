@@ -2,6 +2,7 @@
 #
 #Simple automation wrapper for pqc_benchmark.py
 # Runs all methods and algorithms with a single user input: iteration count.
+# Time and machine-power energy are recorded by pqc_benchmark.py.
 # No external dependencies required.
 # OG
 
@@ -20,7 +21,6 @@ def build_input_sequence(iterations):
         lines.append("0")               # Method: key generation
         lines.append(str(algo_idx))     # Algorithm index
         lines.append(str(iterations))   # Iterations
-        lines.append("")                # Power metrics (blank)
     
     # Method 1: Signatures (14 algorithms, signing only)
     for algo_idx in range(14):
@@ -30,7 +30,6 @@ def build_input_sequence(iterations):
         lines.append(str(algo_idx))
         lines.append("0")               # Submethod: signing
         lines.append(str(iterations))
-        lines.append("")
     
     # Exit
     lines.append("x")
@@ -52,14 +51,16 @@ def main():
             sys.exit(1)
     
     print(f"Running all benchmarks with {args.iterations} iterations...")
+    print("Machine power and energy are recorded automatically when telemetry is available.")
     print("This will take a while. Be patient.\n")
     
     # Build and run
     seq = build_input_sequence(args.iterations)
-    proc = subprocess.run([sys.executable, "pqc_benchmark.py"], input=seq, text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.run([sys.executable, "pqc_benchmark.py"], input=seq, text=True)
     
     if proc.returncode == 0:
-        print("\nAll benchmarks completed successfully! Power readings must be added manually.")
+        print("\nAll benchmarks completed successfully.")
+        print("Time and energy values are in the CSV under results_files/.")
     else:
         print(f"\nBenchmarks finished with return code {proc.returncode}")
     

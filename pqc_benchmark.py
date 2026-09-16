@@ -3,6 +3,10 @@
 # various post-quantum algorithms in key generation, signing, verification, and TLS handshakes. 
 # The benchmark is designed to be run on a local machine and outputs results to a CSV file for analysis.
 #
+# Time is measured for every run. Power and energy are sampled
+# automatically by power_monitor.py on every device: board sensors
+# when present, otherwise CPU package RAPL or TDP x utilization.
+#
 # After benchmarking all the machines, it appears that TLS handshakes are not functioning correctly.
 # I am leaving the code in place for now, to allow for future debugging.
 #
@@ -14,7 +18,10 @@ import os
 import csv
 import datetime
 import time
+
 import platform
+
+import power_monitor
 
 #----------------Initialisation------------------
 # Get machine name and create timestamp
@@ -33,12 +40,125 @@ csv_header = [
 with open(csv_file, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(csv_header)
+print(f"Results CSV: {csv_file}")
 
 # Helper function to append a row to the CSV
 def append_result_row(row):
     with open(csv_file, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(row)
+
+# Power is sampled by power_monitor.py on every device: board sensors
+# when present, otherwise CPU package RAPL or TDP x utilization.
+BASELINE_DURATION = float(os.environ.get("PQC_BASELINE_DURATION", "5"))
+POWER_SAMPLE_INTERVAL = float(os.environ.get("PQC_POWER_INTERVAL", "0.1"))
+BASELINE_POWER = None
+POWER_SOURCE = "UNAVAILABLE"
+TELEMETRY_OK = False
+
+
+def init_machine_power():
+    global BASELINE_POWER, POWER_SOURCE, TELEMETRY_OK
+
+    probe = power_monitor.read_power()
+    POWER_SOURCE = probe.get("source", "UNAVAILABLE")
+    TELEMETRY_OK = probe.get("power_w") is not None
+    platform_name, model = power_monitor.detect_platform()
+
+    print()
+    print("=" * 70)
+    print("Machine power telemetry")
+    print("=" * 70)
+    print(f"Platform : {platform_name}")
+    print(f"Model    : {model}")
+    print(f"Source   : {POWER_SOURCE}")
+
+    if not TELEMETRY_OK:
+        print("Machine power telemetry is unavailable on this device.")
+        print("Time will still be recorded. Energy columns will be left blank.")
+        print("=" * 70)
+        print()
+        return
+
+    if "estimate" in POWER_SOURCE.lower():
+        print("No board power meter on this device; using CPU TDP x utilization.")
+
+    print(f"Measuring idle baseline for {BASELINE_DURATION:.1f}s ...")
+    BASELINE_POWER, POWER_SOURCE = power_monitor.measure_baseline_power(
+        duration=BASELINE_DURATION,
+        interval=max(POWER_SAMPLE_INTERVAL, 0.2),
+        verbose=False
+    )
+
+    if BASELINE_POWER is None:
+        print("Baseline machine power could not be measured.")
+    else:
+        print(f"Baseline machine power: {BASELINE_POWER:.6f} W")
+
+    print("=" * 70)
+    print()
+
+
+def run_timed_workload(work_fn):
+    sampler = power_monitor.PowerSampler(interval=POWER_SAMPLE_INTERVAL)
+
+    if TELEMETRY_OK:
+        sampler.start()
+
+    time_start = time.time()
+    work_fn()
+    time_end = time.time()
+
+    on_load_power = None
+    source = POWER_SOURCE
+
+    if TELEMETRY_OK:
+        on_load_power = sampler.stop()
+        source = sampler.source
+
+    return time_start, time_end, time_end - time_start, on_load_power, source
+
+
+def format_metric(value, digits=9):
+    if value == "" or value is None:
+        return "unavailable"
+    return f"{float(value):.{digits}f}"
+
+
+def record_benchmark(method, submethod, algorithm, iterations, time_start, time_end, total_time, on_load_power, power_source=None):
+    time_per_iteration = total_time / iterations if iterations else 0
+    baseline, onload, net, jpi, ipj = power_monitor.csv_energy_fields(
+        BASELINE_POWER, on_load_power, total_time, iterations
+    )
+    source = power_source or POWER_SOURCE
+    total_energy = float(net) * total_time if net != "" else ""
+
+    print()
+    print("-" * 70)
+    print("Benchmark results")
+    print("-" * 70)
+    print(f"Method              : {method}")
+    if submethod:
+        print(f"Submethod           : {submethod}")
+    print(f"Algorithm           : {algorithm}")
+    print(f"Iterations          : {iterations}")
+    print(f"Total time          : {total_time:.9f} s")
+    print(f"Time / iteration    : {time_per_iteration:.9f} s")
+    print(f"Power source        : {source}")
+    print(f"Baseline power      : {format_metric(baseline)} W")
+    print(f"On-load power       : {format_metric(onload)} W")
+    print(f"Net machine power   : {format_metric(net)} W")
+    print(f"Total energy        : {format_metric(total_energy)} J")
+    print(f"Joules / iteration  : {format_metric(jpi, 12)} J")
+    print(f"Iterations / joule  : {format_metric(ipj)}")
+    print("-" * 70)
+    print()
+
+    append_result_row([
+        machine_name, method, submethod, algorithm, iterations,
+        time_start, time_end, total_time, time_per_iteration,
+        baseline, onload, net, jpi, ipj
+    ])
 
 # Key generation function
 def gen_key(command, args, priv, pub):
@@ -102,21 +222,24 @@ def benchmark_tls_handshake(cert, priv, iterations, port=4433):
     # Give the server a moment to start
     time.sleep(0.5)
     
-    # Run client handshakes and measure time
-    time_start = time.time()
-    for i in range(iterations):
-        subprocess.run([
-            "openssl", "s_client",
-            "-connect", f"localhost:{port}",
-            "-brief"
-        ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time_end = time.time()
+    # Run client handshakes and measure time plus machine power
+    def _work():
+        for i in range(iterations):
+            subprocess.run([
+                "openssl", "s_client",
+                "-connect", f"localhost:{port}",
+                "-brief"
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    time_start, time_end, total_time, on_load_power, source = run_timed_workload(_work)
     
     # Stop the server
     server_proc.terminate()
     server_proc.wait(timeout=5)
     
-    return time_end - time_start
+    return time_start, time_end, total_time, on_load_power, source
+
+init_machine_power()
 
 while True:
     choice = input("Press y to start, x to exit: ")
@@ -167,24 +290,23 @@ while True:
         pub = os.path.join("keys", f"{name.replace(' ', '_').replace('-', '_')}_pub.pem")
 
         iterations = int(input("Enter the number of iterations for key generation: "))
-        time_start = time.time()
-        for i in range(iterations):
-            gen_key(command, args, priv, pub)
-        time_end = time.time()
-        total_time = time_end - time_start
-        time_per_iteration = total_time / iterations
-        power_metrics = input("Enter power metrics (baseline power, on-load power) separated by commas (or leave blank): ")
-        if power_metrics.strip():
-            baseline_power, on_load_power = (power_metrics.split(",") + ["", ""])[:2]
-            baseline_power = baseline_power.strip()
-            on_load_power = on_load_power.strip()
-            total_power = float(on_load_power) - float(baseline_power) if baseline_power and on_load_power else ""
-            joules_per_iteration = float(total_power) * time_per_iteration if total_power and time_per_iteration else ""
-            iterations_per_joule = iterations / (float(total_power) * total_time) if total_power and total_time else ""
-            append_result_row([machine_name, methods[chosenMethod], "", keygen_algorithms[selected][0], iterations, time_start, time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
-        else:
-            baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule = "", "", "", "", ""
-            append_result_row([machine_name, methods[chosenMethod], "", keygen_algorithms[selected][0], iterations, time_start, time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
+
+        def _work():
+            for i in range(iterations):
+                gen_key(command, args, priv, pub)
+
+        time_start, time_end, total_time, on_load_power, power_source = run_timed_workload(_work)
+        record_benchmark(
+            methods[chosenMethod],
+            "",
+            keygen_algorithms[selected][0],
+            iterations,
+            time_start,
+            time_end,
+            total_time,
+            on_load_power,
+            power_source
+        )
 
         
     # 2------------------Signing------------------
@@ -230,24 +352,23 @@ while True:
 
         if selected_method == 0:
             iterations = int(input("Enter the number of iterations for signing: "))
-            time_start = time.time()
-            for i in range(iterations):
-                sign_file(private_key, message_to_sign, signature_output)
-            time_end = time.time()
-            total_time = time_end - time_start
-            time_per_iteration = total_time / iterations if iterations else 0
-            power_metrics = input("Enter power metrics (baseline power, on-load power) separated by commas (or leave blank): ")
-            if power_metrics.strip():
-                baseline_power, on_load_power = (power_metrics.split(",") + ["", ""])[:2]
-                baseline_power = baseline_power.strip()
-                on_load_power = on_load_power.strip()
-                total_power = float(on_load_power) - float(baseline_power) if baseline_power and on_load_power else ""
-                joules_per_iteration = float(total_power) * time_per_iteration if total_power and time_per_iteration else ""
-                iterations_per_joule = iterations / (float(total_power) * total_time) if total_power and total_time else ""
-                append_result_row([machine_name, methods[chosenMethod], signature_methods[selected_method], signature_algorithms[selected][0], iterations, time_start, time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
-            else:
-                baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule = "", "", "", "", ""
-                append_result_row([machine_name, methods[chosenMethod], signature_methods[selected_method], signature_algorithms[selected][0], iterations, time_start, time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
+
+            def _work():
+                for i in range(iterations):
+                    sign_file(private_key, message_to_sign, signature_output)
+
+            time_start, time_end, total_time, on_load_power, power_source = run_timed_workload(_work)
+            record_benchmark(
+                methods[chosenMethod],
+                signature_methods[selected_method],
+                signature_algorithms[selected][0],
+                iterations,
+                time_start,
+                time_end,
+                total_time,
+                on_load_power,
+                power_source
+            )
 
         elif selected_method == 1:
             # Create a signature first to verify
@@ -256,24 +377,23 @@ while True:
             # Verify the signature
             public_key = pub
             iterations = int(input("Enter the number of iterations for signature verification: "))
-            time_start = time.time()
-            for i in range(iterations):
-                verify_signature(public_key, message_to_sign, signature_output)
-            time_end = time.time()
-            total_time = time_end - time_start
-            time_per_iteration = total_time / iterations if iterations else 0
-            power_metrics = input("Enter power metrics (baseline power, on-load power) separated by commas (or leave blank): ")
-            if power_metrics.strip():
-                baseline_power, on_load_power = (power_metrics.split(",") + ["", ""])[:2]
-                baseline_power = baseline_power.strip()
-                on_load_power = on_load_power.strip()
-                total_power = float(on_load_power) - float(baseline_power) if baseline_power and on_load_power else ""
-                joules_per_iteration = float(total_power) * time_per_iteration if total_power and time_per_iteration else ""
-                iterations_per_joule = iterations / (float(total_power) * total_time) if total_power and total_time else ""
-                append_result_row([machine_name, methods[chosenMethod], signature_methods[selected_method], signature_algorithms[selected][0], iterations, time_start, time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
-            else:
-                baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule = "", "", "", "", ""
-                append_result_row([machine_name, methods[chosenMethod], signature_methods[selected_method], signature_algorithms[selected][0], iterations, time_start, time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
+
+            def _work():
+                for i in range(iterations):
+                    verify_signature(public_key, message_to_sign, signature_output)
+
+            time_start, time_end, total_time, on_load_power, power_source = run_timed_workload(_work)
+            record_benchmark(
+                methods[chosenMethod],
+                signature_methods[selected_method],
+                signature_algorithms[selected][0],
+                iterations,
+                time_start,
+                time_end,
+                total_time,
+                on_load_power,
+                power_source
+            )
 
         #3------------------TLS handshake------------------
     elif chosenMethod == 2:
@@ -300,24 +420,16 @@ while True:
         # Get iterations
         iterations = int(input("Enter the number of iterations for TLS handshake: "))
         
-        # Run handshakes and measure time
-        total_time = benchmark_tls_handshake(cert, priv, iterations)
-        time_per_iteration = total_time / iterations
-        
-        # Get power metrics
-        power_metrics = input("Enter power metrics (baseline power, on-load power) separated by commas (or leave blank): ")
-        if power_metrics.strip():
-            baseline_power, on_load_power = (power_metrics.split(",") + ["", ""])[:2]
-            baseline_power = baseline_power.strip()
-            on_load_power = on_load_power.strip()
-            total_power = float(on_load_power) - float(baseline_power) if baseline_power and on_load_power else ""
-            joules_per_iteration = float(total_power) * time_per_iteration if total_power and time_per_iteration else ""
-            iterations_per_joule = iterations / (float(total_power) * total_time) if total_power and total_time else ""
-            tls_time_start = time.time() - total_time
-            tls_time_end = time.time()
-            append_result_row([machine_name, methods[chosenMethod], "", tls_algorithms[selected][0], iterations, tls_time_start, tls_time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
-        else:
-            baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule = "", "", "", "", ""
-            tls_time_start = time.time() - total_time
-            tls_time_end = time.time()
-            append_result_row([machine_name, methods[chosenMethod], "", tls_algorithms[selected][0], iterations, tls_time_start, tls_time_end, total_time, time_per_iteration, baseline_power, on_load_power, total_power, joules_per_iteration, iterations_per_joule])
+        # Run handshakes and measure time plus machine power
+        time_start, time_end, total_time, on_load_power, power_source = benchmark_tls_handshake(cert, priv, iterations)
+        record_benchmark(
+            methods[chosenMethod],
+            "",
+            tls_algorithms[selected][0],
+            iterations,
+            time_start,
+            time_end,
+            total_time,
+            on_load_power,
+            power_source
+        )
