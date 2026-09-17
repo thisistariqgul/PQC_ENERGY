@@ -128,26 +128,55 @@ def detect_platform():
 # COMMAND
 # ============================================================
 
+LAST_CMD_ERROR = ""
+PMIC_ERROR = ""
+
+
 def command_exists(command):
 
-    return shutil.which(command) is not None
+    return find_command(command) is not None
+
+
+def find_command(command):
+
+    path = shutil.which(command)
+    if path:
+        return path
+
+    extras = [
+        os.path.join("/usr/bin", command),
+        os.path.join("/usr/local/bin", command),
+        os.path.join("/opt/vc/bin", command),
+        os.path.join("/bin", command),
+    ]
+
+    for extra in extras:
+        if os.path.isfile(extra) and os.access(extra, os.X_OK):
+            return extra
+
+    return None
 
 
 def run_command(command):
+
+    global LAST_CMD_ERROR
+    LAST_CMD_ERROR = ""
 
     try:
 
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=3
+            timeout=5
         )
 
-        return result.stdout.strip()
+        LAST_CMD_ERROR = (result.stderr or "").strip()
+        return (result.stdout or "").strip()
 
-    except Exception:
+    except Exception as exc:
+        LAST_CMD_ERROR = str(exc)
         return ""
 
 
@@ -157,14 +186,20 @@ def run_command(command):
 
 def read_pi5_power():
 
-    if not command_exists("vcgencmd"):
+    global PMIC_ERROR
+
+    vcgencmd = find_command("vcgencmd")
+
+    if vcgencmd is None:
+        PMIC_ERROR = "vcgencmd not found"
         return None
 
     output = run_command(
-        ["vcgencmd", "pmic_read_adc"]
+        [vcgencmd, "pmic_read_adc"]
     )
 
     if not output:
+        PMIC_ERROR = LAST_CMD_ERROR or "empty pmic_read_adc output"
         return None
 
     currents = {}
@@ -173,7 +208,7 @@ def read_pi5_power():
     for line in output.splitlines():
 
         current_match = re.search(
-            r"(.+?)\s+current\(\d+\)=([0-9.]+)A",
+            r"([A-Za-z0-9_]+)\s+current\(\d+\)=\s*([0-9.eE+-]+)\s*A",
             line
         )
 
@@ -181,11 +216,10 @@ def read_pi5_power():
 
             name = current_match.group(1).strip()
             value = float(current_match.group(2))
-
             currents[name] = value
 
         voltage_match = re.search(
-            r"(.+?)\s+volt\(\d+\)=([0-9.]+)V",
+            r"([A-Za-z0-9_]+)\s+volt\(\d+\)=\s*([0-9.eE+-]+)\s*V",
             line
         )
 
@@ -193,7 +227,6 @@ def read_pi5_power():
 
             name = voltage_match.group(1).strip()
             value = float(voltage_match.group(2))
-
             voltages[name] = value
 
     # --------------------------------------------------------
@@ -205,14 +238,10 @@ def read_pi5_power():
 
     for current_name, current in currents.items():
 
-        if not current_name.endswith("_A"):
-            continue
-
-        voltage_name = (
-            current_name[:-2] + "_V"
-        )
-
-        voltage = voltages.get(voltage_name)
+        rail = current_name[:-2] if current_name.endswith("_A") else current_name
+        voltage = voltages.get(rail + "_V")
+        if voltage is None:
+            voltage = voltages.get(current_name.replace("_A", "_V"))
 
         if voltage is not None:
 

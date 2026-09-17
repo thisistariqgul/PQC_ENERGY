@@ -6,9 +6,14 @@
 # No external dependencies required.
 # OG
 
+import os
 import subprocess
 import sys
 import argparse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BENCHMARK = os.path.join(HERE, "pqc_benchmark.py")
+POWER_MONITOR = os.path.join(HERE, "power_monitor.py")
 
 
 def build_input_sequence(iterations):
@@ -41,6 +46,14 @@ def main():
     parser = argparse.ArgumentParser(description="Automate all pqc_benchmark.py benchmarks.")
     parser.add_argument("--iterations", type=int, default=None, help="Iterations per benchmark (required)")
     args = parser.parse_args()
+
+    if not os.path.isfile(BENCHMARK):
+        print(f"ERROR: {BENCHMARK} not found.")
+        sys.exit(1)
+    if not os.path.isfile(POWER_MONITOR):
+        print("ERROR: power_monitor.py must be in the same folder as pqc_benchmark_automated.py.")
+        print(f"Missing: {POWER_MONITOR}")
+        sys.exit(1)
     
     # Ask for iterations if not provided
     if args.iterations is None:
@@ -51,18 +64,29 @@ def main():
             sys.exit(1)
     
     print(f"Running all benchmarks with {args.iterations} iterations...")
-    print("Machine power and energy are recorded automatically when telemetry is available.")
+    print("Machine power and energy are recorded automatically.")
+    print(f"Working folder: {HERE}")
     print("This will take a while. Be patient.\n")
     
-    # Build and run
+    # Build and run from this script's folder so results_files/ is created here.
     seq = build_input_sequence(args.iterations)
-    proc = subprocess.run([sys.executable, "pqc_benchmark.py"], input=seq, text=True)
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    proc = subprocess.run(
+        [sys.executable, "-u", BENCHMARK],
+        input=seq,
+        text=True,
+        cwd=HERE,
+        env=env,
+    )
     
     if proc.returncode == 0:
         print("\nAll benchmarks completed successfully.")
-        print("Time and energy values are in the CSV under results_files/.")
+        print(f"Time and energy values are in: {os.path.join(HERE, 'results_files')}")
+        print(f"Latest copy: {os.path.join(HERE, 'results_files', 'latest.csv')}")
     else:
         print(f"\nBenchmarks finished with return code {proc.returncode}")
+        print(f"Check {os.path.join(HERE, 'results_files')} for any partial CSV.")
     
     sys.exit(proc.returncode)
 
