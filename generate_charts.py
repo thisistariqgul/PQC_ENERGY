@@ -21,8 +21,8 @@ DPI = 150
 # Data-loading helpers
 # ---------------------------------------------------------------------------
 
-def load_results_csv(filepath='results.csv'):
-    """Return a list of row dicts from results.csv, skipping blank rows."""
+def load_results_csv(filepath='full_results_all.csv'):
+    """Return a list of row dicts from the results CSV, skipping blank rows."""
     rows = []
     with open(filepath, newline='', encoding='utf-8-sig') as fh:
         reader = csv.DictReader(fh)
@@ -83,10 +83,15 @@ MACHINE_LABELS = {
     'pizero2':        'Pi Zero 2',
     'pi3':            'Pi 3',
     'pi4':            'Pi 4',
+    'pi5':            'Pi 5',
+    'CSE-MTECHLAB-06':'Lab PC\ni9-14900',
     'MacBookAir':     'MacBook Air',
     'Thinkpad-Intel': 'ThinkPad\nIntel',
     'Thinkpad-AMD':   'ThinkPad\nAMD',
 }
+
+PI_MACHINES = ['pi1', 'pizero', 'pi2', 'pi2b', 'pizero2', 'pi3', 'pi4', 'pi5', 'CSE-MTECHLAB-06']
+ENERGY_MACHINES = ['pizero', 'pi1', 'pi2', 'pi2b', 'pizero2', 'pi3', 'pi4', 'pi5', 'CSE-MTECHLAB-06']
 
 
 def _bar_positions(n_groups, n_bars, bar_width=0.15, gap=0.05):
@@ -100,24 +105,42 @@ def _bar_positions(n_groups, n_bars, bar_width=0.15, gap=0.05):
 # ---------------------------------------------------------------------------
 # Chart 1 – Signing Energy Cost per Iteration (Log Scale)
 # ---------------------------------------------------------------------------
-def chart_01_signing_energy_log():
-    _, signing = load_joules_per_iteration()
+def _lookup(results, method, submethod, machines, algorithms, field):
+    lookup = {}
+    for row in results:
+        if row['method'] != method:
+            continue
+        if submethod is not None and (row.get('submethod') or '') != submethod:
+            continue
+        machine = row['machine']
+        algorithm = row['algorithm']
+        if machine not in machines or algorithm not in algorithms:
+            continue
+        try:
+            lookup.setdefault(machine, {})[algorithm] = float(row[field])
+        except (TypeError, ValueError):
+            continue
+    return lookup
 
-    machines_order = ['pi1', 'pizero', 'pi2', 'pi2b', 'pizero2', 'pi3', 'pi4']
+
+def chart_01_signing_energy_log():
+    results = load_results_csv()
+    machines_order = PI_MACHINES
     algos_order = [
-        'ecdsa',
-        'ml-dsa-44',
-        'slh-dsa-sha2-128f',
-        'slh-dsa-sha2-128s',
-        'slh-dsa-shake-192s',
+        'ECDSA P-256',
+        'ML-DSA-44',
+        'SLH-DSA-SHA2-128f',
+        'SLH-DSA-SHA2-128s',
+        'SLH-DSA-SHAKE-192s',
     ]
     algo_labels = {
-        'ecdsa':              'ECDSA',
-        'ml-dsa-44':          'ML-DSA-44',
-        'slh-dsa-sha2-128f':  'SLH-DSA-SHA2-128f',
-        'slh-dsa-sha2-128s':  'SLH-DSA-SHA2-128s',
-        'slh-dsa-shake-192s': 'SLH-DSA-SHAKE-192s',
+        'ECDSA P-256':          'ECDSA',
+        'ML-DSA-44':            'ML-DSA-44',
+        'SLH-DSA-SHA2-128f':    'SLH-DSA-SHA2-128f',
+        'SLH-DSA-SHA2-128s':    'SLH-DSA-SHA2-128s',
+        'SLH-DSA-SHAKE-192s':   'SLH-DSA-SHAKE-192s',
     }
+    lookup = _lookup(results, 'signatures', 'signing', machines_order, algos_order, 'joules per iteration')
 
     n_groups = len(machines_order)
     n_bars = len(algos_order)
@@ -125,9 +148,9 @@ def chart_01_signing_energy_log():
     centres, offsets = _bar_positions(n_groups, n_bars, bar_width=bar_width)
     colours = plt.cm.tab10.colors[:n_bars]
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(16, 6.5))
     for idx, algo in enumerate(algos_order):
-        values = [signing[algo].get(m) for m in machines_order]
+        values = [lookup.get(m, {}).get(algo) for m in machines_order]
         positions = centres + offsets[idx]
         ax.bar(positions, values, width=bar_width, label=algo_labels[algo],
                color=colours[idx], edgecolor='white', linewidth=0.5)
@@ -152,17 +175,9 @@ def chart_01_signing_energy_log():
 def chart_03_kem_feasibility_time():
     results = load_results_csv()
 
-    machines_order = ['pi1', 'pizero', 'pi2', 'pi2b', 'pizero2', 'pi3', 'pi4']
+    machines_order = PI_MACHINES
     algos_order = ['ECDH P-256', 'X25519', 'ML-KEM-512', 'ML-KEM-768', 'ML-KEM-1024']
-
-    lookup = {}
-    for row in results:
-        if row['method'] != 'key generation':
-            continue
-        m = row['machine']
-        a = row['algorithm']
-        if m in machines_order and a in algos_order:
-            lookup.setdefault(m, {})[a] = float(row['time per iteration'])
+    lookup = _lookup(results, 'key generation', '', machines_order, algos_order, 'time per iteration')
 
     n_groups = len(machines_order)
     n_bars = len(algos_order)
@@ -170,7 +185,7 @@ def chart_03_kem_feasibility_time():
     centres, offsets = _bar_positions(n_groups, n_bars, bar_width=bar_width)
     colours = plt.cm.tab10.colors[:n_bars]
 
-    fig, ax = plt.subplots(figsize=(13, 6))
+    fig, ax = plt.subplots(figsize=(16, 6.5))
     for idx, algo in enumerate(algos_order):
         values = [lookup.get(m, {}).get(algo) for m in machines_order]
         positions = centres + offsets[idx]
@@ -195,27 +210,19 @@ def chart_03_kem_feasibility_time():
 # ---------------------------------------------------------------------------
 def chart_07_mlkem_energy_efficiency():
     """
-    Data sourced directly from results.csv (ML-KEM-768, key generation).
+    ML-KEM-768 key generation from full_results_all.csv.
     Joules = joules_per_iteration x 100.
     """
 
-    machines_order = ['pizero', 'pi1', 'pi2', 'pi2b', 'pizero2', 'pi3', 'pi4']
-    display_names  = ['Pi Zero', 'Pi 1', 'Pi 2\n(32-bit)', 'Pi 2\n(64-bit)',
-                      'Pi Zero 2', 'Pi 3', 'Pi 4']
+    machines_order = ENERGY_MACHINES
+    display_names = [MACHINE_LABELS[m] for m in machines_order]
+    lookup = _lookup(
+        load_results_csv(), 'key generation', '',
+        machines_order, ['ML-KEM-768'], 'joules per iteration'
+    )
+    joules_values = [lookup.get(m, {}).get('ML-KEM-768', 0) * 100 for m in machines_order]
 
-    joules_100 = {
-        'pizero':  0.049994217 * 100,
-        'pi1':     0.050223016 * 100,
-        'pi2':     0.041849514 * 100,
-        'pi2b':    0.035639249 * 100,
-        'pizero2': 0.038845593 * 100,
-        'pi3':     0.043442313 * 100,
-        'pi4':     0.035161105 * 100,
-    }
-
-    joules_values = [joules_100[m] for m in machines_order]
-
-    fig, ax = plt.subplots(figsize=(13, 7))
+    fig, ax = plt.subplots(figsize=(15, 7))
 
     bars = ax.bar(range(len(machines_order)), joules_values, width=0.6,
                   label='Energy Used — 100 iterations (Joules)',
@@ -230,10 +237,12 @@ def chart_07_mlkem_energy_efficiency():
     ax.set_xticks(range(len(machines_order)))
     ax.set_xticklabels(display_names, fontsize=11)
 
+    label_gap = max(joules_values) * 0.015
     for bar, val in zip(bars, joules_values):
-        ax.text(bar.get_x() + bar.get_width() / 2, val + 0.05,
+        ax.text(bar.get_x() + bar.get_width() / 2, val + label_gap,
                 f'{val:.2f} J', ha='center', va='bottom',
                 fontsize=9, fontweight='bold', color='#2E86AB')
+    ax.set_ylim(0, max(joules_values) * 1.12)
 
     ax.set_title(
         'ML-KEM-768 Key Generation — Energy for 100 Operations',
@@ -251,27 +260,19 @@ def chart_07_mlkem_energy_efficiency():
 # ---------------------------------------------------------------------------
 def chart_08_slh_dsa_energy_efficiency():
     """
-    Data sourced directly from results.csv (SLH-DSA-SHAKE-192s, signatures).
+    SLH-DSA-SHAKE-192s signing from full_results_all.csv.
     Joules = joules_per_iteration x 100 (extrapolated where only 10 iters run).
     """
 
-    machines_order = ['pizero', 'pi1', 'pi2', 'pi2b', 'pizero2', 'pi3', 'pi4']
-    display_names  = ['Pi Zero', 'Pi 1', 'Pi 2\n(32-bit)', 'Pi 2\n(64-bit)',
-                      'Pi Zero 2', 'Pi 3', 'Pi 4']
+    machines_order = ENERGY_MACHINES
+    display_names = [MACHINE_LABELS[m] for m in machines_order]
+    lookup = _lookup(
+        load_results_csv(), 'signatures', 'signing',
+        machines_order, ['SLH-DSA-SHAKE-192s'], 'joules per iteration'
+    )
+    joules_values = [lookup.get(m, {}).get('SLH-DSA-SHAKE-192s', 0) * 100 for m in machines_order]
 
-    joules_100 = {
-        'pizero':  24.76296897  * 100,
-        'pi1':     18.76015142  * 100,
-        'pi2':     19.65578286  * 100,
-        'pi2b':     5.730838546 * 100,
-        'pizero2':  6.528834304 * 100,
-        'pi3':      7.374940633 * 100,
-        'pi4':      5.471396597 * 100,
-    }
-
-    joules_values = [joules_100[m] for m in machines_order]
-
-    fig, ax = plt.subplots(figsize=(13, 7))
+    fig, ax = plt.subplots(figsize=(15, 7))
 
     bars = ax.bar(range(len(machines_order)), joules_values, width=0.6,
                   label='Energy Used — 100 iterations (Joules)',
@@ -286,10 +287,12 @@ def chart_08_slh_dsa_energy_efficiency():
     ax.set_xticks(range(len(machines_order)))
     ax.set_xticklabels(display_names, fontsize=11)
 
+    label_gap = max(joules_values) * 0.015
     for bar, val in zip(bars, joules_values):
-        ax.text(bar.get_x() + bar.get_width() / 2, val + 20,
+        ax.text(bar.get_x() + bar.get_width() / 2, val + label_gap,
                 f'{val:.0f} J', ha='center', va='bottom',
                 fontsize=9, fontweight='bold', color='#C44E52')
+    ax.set_ylim(0, max(joules_values) * 1.12)
 
     ax.set_title(
         'SLH-DSA-SHAKE-192s Signing — Energy for 100 Operations\n'

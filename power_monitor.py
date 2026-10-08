@@ -262,29 +262,52 @@ def read_pi5_power():
 # JETSON NANO INA3221
 # ============================================================
 
-def find_ina3221():
+def _has_power_inputs(path):
 
-    possible = [
-        "/sys/bus/i2c/drivers/ina3221x/6-0040/iio:device0",
-        "/sys/bus/i2c/drivers/ina3221x/7-0040/iio:device0",
-        "/sys/bus/i2c/drivers/ina3221x/1-0040/iio:device0",
-        "/sys/bus/i2c/drivers/ina3221x/0-0040/iio:device0"
-    ]
+    try:
+        names = os.listdir(path)
+    except Exception:
+        return False
 
-    for path in possible:
-
-        if os.path.isdir(path):
-            return path
-
-    matches = glob.glob(
-        "/sys/bus/i2c/drivers/ina3221*/**/iio:device*",
-        recursive=True
+    return any(
+        name.startswith("in_power") and name.endswith("_input")
+        for name in names
     )
 
-    for path in matches:
 
-        if os.path.isdir(path):
-            return path
+def find_ina3221():
+
+    patterns = [
+        "/sys/bus/i2c/drivers/ina3221x/*/iio:device*",
+        "/sys/bus/i2c/drivers/ina3221/*/iio:device*",
+        "/sys/bus/i2c/drivers/ina3221x/*",
+        "/sys/bus/i2c/drivers/ina3221/*",
+        "/sys/bus/i2c/devices/*/iio:device*",
+        "/sys/bus/i2c/devices/*",
+        "/sys/class/hwmon/hwmon*",
+    ]
+
+    for pattern in patterns:
+
+        for path in glob.glob(pattern):
+
+            if not os.path.isdir(path) or not _has_power_inputs(path):
+                continue
+
+            name = (read_file(os.path.join(path, "name")) or "").lower()
+            blob = " ".join([
+                path.lower(),
+                name,
+                os.path.basename(os.path.dirname(path)).lower(),
+            ])
+
+            if (
+                "ina3221" in blob
+                or os.path.exists(os.path.join(path, "rail_name_0"))
+                or "0040" in path
+                or "0041" in path
+            ):
+                return path
 
     return None
 
@@ -366,65 +389,68 @@ def read_jetson_ina3221():
     if not rails:
         return None
 
-    # Machine power is the board input rail, not the sum of
-    # VDD_IN + VDD_CPU + VDD_GPU (that would double-count).
-    vdd_in = None
+    # Board input only. Summing VDD_IN + CPU + GPU double-counts.
+    power, rail_name = pick_board_input(rails, labels)
 
-    for channel, power_w in rails.items():
-
-        label = labels.get(channel, "").upper()
-
-        if "VDD_IN" in label or label == "VIN":
-            vdd_in = power_w
-            break
-
-    if vdd_in is None:
-
-        for channel, label in labels.items():
-
-            up = label.upper()
-
-            if "IN" in up and "CPU" not in up and "GPU" not in up:
-                vdd_in = rails[channel]
-                break
-
-    if vdd_in is None:
-        # Channel 0 is VDD_IN on Jetson Nano.
-        vdd_in = rails.get("0", next(iter(rails.values())))
+    if power is None:
+        return None
 
     return {
-        "power_w": vdd_in,
-        "source": "Jetson INA3221 VDD_IN",
+        "power_w": power,
+        "source": f"Jetson INA3221 {rail_name}",
         "rails": rails
     }
 
 
-# ============================================================
-# JETSON TEGRASTATS FALLBACK
-# ============================================================
+def pick_board_input(rails, labels):
 
-def read_jetson_tegrastats():
+    """Return (watts, rail name) for the whole-board input rail."""
 
-    if not command_exists("tegrastats"):
-        return None
-
-    output = run_command(
-        ["tegrastats", "--interval", "100", "--count", "1"]
+    preferred = (
+        "POM_5V_IN",
+        "VDD_IN",
+        "VIN_SYS_5V0",
+        "VDD_SYS_SOC",
     )
 
-    if not output:
+    named = {
+        channel: (labels.get(channel) or channel).upper().replace(" ", "")
+        for channel in rails
+    }
+
+    for token in preferred:
+        for channel, label in named.items():
+            if token in label:
+                return rails[channel], token
+
+    for channel, label in named.items():
+        if "IN" in label and "CPU" not in label and "GPU" not in label:
+            return rails[channel], label
+
+    # Channel 0 is POM_5V_IN / VDD_IN on Jetson Nano.
+    if "0" in rails:
+        return rails["0"], "CH0"
+
+    return None, None
+
+
+def parse_tegrastats_power(text):
+
+    """Parse one tegrastats line into board input power.
+
+    Jetson Nano prints:
+        POM_5V_IN 1245/1245 POM_5V_GPU 0/0 POM_5V_CPU 123/123
+    Xavier / Orin print:
+        VDD_IN 2874mW/2874mW
+    """
+
+    if not text:
         return None
 
-    # Look for:
-    #
-    # VDD_IN xxxmW/xxxmW
-    #
-    # or other VDD power rails.
-
     matches = re.findall(
-        r"(VDD_[A-Za-z0-9_]+)\s+"
-        r"([0-9]+)mW(?:/([0-9]+)mW)?",
-        output
+        r"((?:VDD|POM|VIN)_[A-Za-z0-9_]+)\s+"
+        r"([0-9]+)(?:mW)?(?:/[0-9]+(?:mW)?)?",
+        text
     )
 
     if not matches:
@@ -432,23 +458,107 @@ def read_jetson_tegrastats():
 
     rails = {}
 
-    for rail, current, average in matches:
+    for rail, milliwatts in matches:
+        rails[rail] = float(milliwatts) / 1000.0
 
-        rails[rail] = float(current) / 1000.0
+    power, rail_name = pick_board_input(rails, {name: name for name in rails})
 
-    if "VDD_IN" in rails:
-
-        power = rails["VDD_IN"]
-
-    else:
-
-        power = sum(rails.values())
+    if power is None:
+        return None
 
     return {
         "power_w": power,
-        "source": "Jetson tegrastats VDD_IN",
+        "source": f"Jetson tegrastats {rail_name}",
         "rails": rails
     }
+
+
+class _JetsonTegrastats:
+    """One long-running tegrastats process. Do not spawn it per sample."""
+
+    def __init__(self):
+        self._latest = None
+        self._lock = threading.Lock()
+        self._proc = None
+        self._dead = False
+        self._waited = False
+        self._started = False
+
+    def read(self):
+
+        self._ensure_started()
+
+        if not self._waited and self._latest is None and not self._dead:
+            self._waited = True
+            deadline = time.monotonic() + 2.5
+            while (
+                self._latest is None
+                and not self._dead
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+
+        with self._lock:
+            return self._latest
+
+    def _ensure_started(self):
+
+        if self._started or self._dead:
+            return
+
+        self._started = True
+        command = find_command("tegrastats")
+
+        if command is None:
+            self._dead = True
+            return
+
+        try:
+            self._proc = subprocess.Popen(
+                [command, "--interval", "200"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1
+            )
+        except Exception:
+            self._dead = True
+            return
+
+        thread = threading.Thread(target=self._loop, daemon=True)
+        thread.start()
+
+    def _loop(self):
+
+        try:
+            for line in self._proc.stdout:
+                parsed = parse_tegrastats_power(line)
+                if parsed is None:
+                    continue
+                with self._lock:
+                    self._latest = parsed
+        except Exception:
+            pass
+        finally:
+            self._dead = True
+
+
+_jetson_tegrastats = _JetsonTegrastats()
+
+
+def read_jetson_tegrastats():
+
+    return _jetson_tegrastats.read()
+
+
+def read_jetson_power():
+
+    result = read_jetson_ina3221()
+
+    if result:
+        return result
+
+    return read_jetson_tegrastats()
 
 
 # ============================================================
@@ -1163,11 +1273,7 @@ def read_power():
         or os.path.exists("/etc/nv_tegra_release")
         or command_exists("tegrastats")
     ):
-        result = read_jetson_ina3221()
-        if result:
-            return result
-
-        result = read_jetson_tegrastats()
+        result = read_jetson_power()
         if result:
             return result
 
